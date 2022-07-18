@@ -19,11 +19,12 @@ import math
 from textwrap import wrap
 import json
 import abc
+import time
+import urllib3
 
 
 mode = 'justext'
-
-num_threads = 32
+num_threads = 90
 
 import re
 def clean_for_bloom(x):
@@ -57,20 +58,36 @@ def urls_of_block(block):
 
 
 def warcurl_to_contents(warc_url):
-    try:
-        response = requests.get(warc_url.strip(), stream=True)
-        for record in ArchiveIterator(response.raw, arc2warc=True):
-            if record.rec_type == 'response':
-                content = record.content_stream().read()
-                meta = {
-                    'warc': warc_url.strip(),
-                    'warc_headers': record.rec_headers.headers,
-                    'http_response_headers': record.http_headers.headers,
-                }
-                yield content, meta
-    except warcio.exceptions.ArchiveLoadFailed:
-        print('WARNING: WARC load failed!')
-        traceback.print_exc()
+    try_again = True
+    try_cnt = 0
+    while try_again:
+        try:
+            response = requests.get(warc_url.strip(), stream=True)
+            try_again = False
+            for record in ArchiveIterator(response.raw, arc2warc=True):
+                if record.rec_type == 'response':
+                    content = record.content_stream().read()
+                    meta = {
+                        'warc': warc_url.strip(),
+                        'warc_headers': record.rec_headers.headers,
+                        'http_response_headers': record.http_headers.headers,
+                    }
+                    yield content, meta
+        except warcio.exceptions.ArchiveLoadFailed:
+            print('WARNING: WARC load failed!')
+            try_again = False
+            traceback.print_exc()
+        except (ConnectionResetError, urllib3.exceptions.ProtocolError) as e:
+            try_again = True
+            try_cnt += 1
+            print('WARNING: Connection reset error! trying count: ', try_cnt)
+            if try_cnt > 25:
+                print('WARNING: Too many tries!')
+                print('WARNING: Skipping this url: ', warc_url)
+                try_again = False
+                return None
+            time.sleep(1)
+            continue 
 
 
 
@@ -171,7 +188,7 @@ class ArchiveHook(Hook):
     def write_doc(self, doc, meta):
         lang = meta['primary_language']
         if lang not in self.ars:
-            self.ars[lang] = lmd.Archive(f'output2/{lang}', compression_level=7)
+            self.ars[lang] = lmd.Archive(f'output/{lang}', compression_level=7)
         self.ars[lang].add_data(doc, meta)
         self.ct_by_lang[lang] += 1
         self.total_docs += 1
@@ -179,7 +196,7 @@ class ArchiveHook(Hook):
     def commit_block(self, block):
         for ar in self.ars.values(): ar.commit(archive_name=block)
 
-        with open('output2/stats_{}.txt'.format(block), 'w') as fh:
+        with open('output/stats_{}.txt'.format(block), 'w') as fh:
             fh.write('total docs: {}\n'.format(self.total_docs))
             fh.write('totals by lang: {}\n'.format(self.ct_by_lang))
 
@@ -205,5 +222,5 @@ if __name__ == '__main__':
         warc_urls = fh.readlines()
     warc_urls_split = [warc_urls[i:i+len(warc_urls) // num_threads] for i in range(0, len(warc_urls), len(warc_urls) // num_threads)]
     hooks = [ArchiveHook() for _ in range(num_threads)]
-    with mp.Pool(64) as p:
+    with mp.Pool(num_threads) as p:
         list(tqdm(p.imap(download, warc_urls_split), total=len(warc_urls) // num_threads))

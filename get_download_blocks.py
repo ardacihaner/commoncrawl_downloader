@@ -8,7 +8,6 @@ def generate_warc_urls(block_dict, n_blocks):
     for _, url_list in tqdm(block_dict.items()):
         random.shuffle(url_list)
         down_blocks.extend(url_list[:n_blocks])
-        print(url_list[:n_blocks])
     return down_blocks
 
 if __name__ == "__main__":
