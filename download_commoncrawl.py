@@ -209,12 +209,13 @@ class ArchiveHook(Hook):
 def download(warc_urls):
     hook = ArchiveHook()
     for url in warc_urls:
+        block_name = "-".join(url.split('/')[-1].split('.')[0].split('-')[2:4])
         for cc_tuple in get_cc_text(url, html_to_text):
             if cc_tuple is None: continue
             text, meta = cc_tuple
             hook.write_doc(text, meta)
         
-        hook.commit_block(url)
+        hook.commit_block(block_name)
 
 
 if __name__ == '__main__':
