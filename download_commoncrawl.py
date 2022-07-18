@@ -5,6 +5,7 @@ import warcio
 from warcio.archiveiterator import ArchiveIterator
 import requests
 import traceback
+import concurrent.futures
 import lm_dataformat as lmd
 import cchardet as chardet
 import unicodedata
@@ -22,9 +23,7 @@ import abc
 
 mode = 'justext'
 
-
-blocks_to_download = sys.argv[1].split(',')
-num_threads = int(os.environ['NUM_CORES'])
+num_threads = 32
 
 import re
 def clean_for_bloom(x):
@@ -53,8 +52,8 @@ def chunked_compression_ratio(text, chksize):
 
 
 def urls_of_block(block):
-    with open('warc_blocks/urls_' + block.rjust(4, '0')) as fh:
-        yield from map(lambda x: "https://commoncrawl.s3.amazonaws.com/" + x, fh)
+    with open('warc_blocks/urls_' + block.rjust(5, '0')) as fh:
+        yield from map(lambda x: "https://data.commoncrawl.org/" + x, fh)
 
 
 def warcurl_to_contents(warc_url):
@@ -68,16 +67,12 @@ def warcurl_to_contents(warc_url):
                     'warc_headers': record.rec_headers.headers,
                     'http_response_headers': record.http_headers.headers,
                 }
-
                 yield content, meta
     except warcio.exceptions.ArchiveLoadFailed:
         print('WARNING: WARC load failed!')
         traceback.print_exc()
 
 
-def warcurls_to_contents(warc_urls):
-    for url in tqdm(list(warc_urls)):
-        yield from warcurl_to_contents(url)
 
 
 import pycld2 as cld2
@@ -89,8 +84,7 @@ langdet = fasttext.load_model("lid.176.bin")
 
 
 # todo: make HtmlExtractor class to seperate justext and trafilatura logic
-def html_to_text(args):
-    html, meta = args
+def html_to_text(html, meta):
     try:
         html = html.decode('utf-8')
     except UnicodeDecodeError: 
@@ -152,12 +146,11 @@ def html_to_text(args):
         traceback.print_exc()
 
 
-def get_cc_text(warc_urls, html_to_text):
-    pool = mp.Pool(num_threads)
-
-    yield from filter(lambda x:x and x[0],
-                      pool.imap(html_to_text, warcurls_to_contents(warc_urls)))
-
+def get_cc_text(warc_url, html_to_text):
+    for warc_tuple in warcurl_to_contents(warc_url):
+        if not warc_tuple: 
+            continue
+        yield html_to_text(*warc_tuple)
 
 class Hook(abc.ABC):
     @abc.abstractmethod
@@ -178,14 +171,15 @@ class ArchiveHook(Hook):
     def write_doc(self, doc, meta):
         lang = meta['primary_language']
         if lang not in self.ars:
-            self.ars[lang] = lmd.Archive(f'output/{lang}', compression_level=7)
+            self.ars[lang] = lmd.Archive(f'output2/{lang}', compression_level=7)
+        self.ars[lang].add_data(doc, meta)
         self.ct_by_lang[lang] += 1
         self.total_docs += 1
 
     def commit_block(self, block):
         for ar in self.ars.values(): ar.commit(archive_name=block)
 
-        with open('output/stats_{}.txt'.format(block), 'w') as fh:
+        with open('output2/stats_{}.txt'.format(block), 'w') as fh:
             fh.write('total docs: {}\n'.format(self.total_docs))
             fh.write('totals by lang: {}\n'.format(self.ct_by_lang))
 
@@ -195,19 +189,21 @@ class ArchiveHook(Hook):
             
 
 
-def download(blocks, html_to_text, keep_doc, hooks):
-    for block in blocks:
-        print('Downloading block', block)
-        warcurls = urls_of_block(block)
-
-        for text, meta in get_cc_text(warcurls, html_to_text):
-            if keep_doc(text):
-                for hook in hooks: hook.write_doc(text, meta)
+def download(warc_urls):
+    hook = ArchiveHook()
+    for url in warc_urls:
+        for cc_tuple in get_cc_text(url, html_to_text):
+            if cc_tuple is None: continue
+            text, meta = cc_tuple
+            hook.write_doc(text, meta)
         
-        for hook in hooks: hook.commit_block(block)
+        hook.commit_block(url)
 
-def keep_doc(doc):
-    return True
 
 if __name__ == '__main__':
-    download(blocks_to_download, html_to_text, keep_doc, [ArchiveHook()])
+    with open('warc_urls.txt', 'r') as fh:
+        warc_urls = fh.readlines()
+    warc_urls_split = [warc_urls[i:i+len(warc_urls) // num_threads] for i in range(0, len(warc_urls), len(warc_urls) // num_threads)]
+    hooks = [ArchiveHook() for _ in range(num_threads)]
+    with mp.Pool(64) as p:
+        list(tqdm(p.imap(download, warc_urls_split), total=len(warc_urls) // num_threads))

@@ -6,7 +6,7 @@ import zlib
 
 if __name__ == '__main__':
     
-    index_path = 'indexes_20200607105929'
+    index_path = 'indexes'
 
     ret = []
     with open(index_path) as ind:
