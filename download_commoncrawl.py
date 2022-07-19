@@ -5,7 +5,6 @@ import warcio
 from warcio.archiveiterator import ArchiveIterator
 import requests
 import traceback
-import concurrent.futures
 import lm_dataformat as lmd
 import cchardet as chardet
 import unicodedata
@@ -13,7 +12,6 @@ import os
 import fasttext
 import trafilatura
 import collections
-import pybloomfilter
 import zstd
 import math
 from textwrap import wrap
@@ -24,12 +22,7 @@ import urllib3
 
 
 mode = 'justext'
-num_threads = 90
-
-import re
-def clean_for_bloom(x):
-    x = re.sub(r'\d', '#', x.lower().strip())
-    return x
+num_threads = 96
 
 def mean(x):
     return sum(x) / len(x)
@@ -80,13 +73,12 @@ def warcurl_to_contents(warc_url):
         except (ConnectionResetError, urllib3.exceptions.ProtocolError) as e:
             try_again = True
             try_cnt += 1
-            print('WARNING: Connection reset error! trying count: ', try_cnt)
-            if try_cnt > 25:
+            if try_cnt > 15:
                 print('WARNING: Too many tries!')
                 print('WARNING: Skipping this url: ', warc_url)
                 try_again = False
                 return None
-            time.sleep(1)
+            time.sleep(5)
             continue 
 
 
@@ -134,9 +126,12 @@ def html_to_text(html, meta):
                     'extractor': 'justext',
                     **meta
                 }
-                return [x.text for x in 
-                            justext.justext(html, justext.get_stoplist('English')) 
-                        if not x.is_boilerplate], meta
+                try:
+                    return [x.text for x in 
+                                justext.justext(html, justext.get_stoplist('English')) 
+                            if not x.is_boilerplate], meta
+                except ValueError:
+                    return "", meta
         elif mode == 'trafilatura':
             result = trafilatura.extract(html)
             if result is None:
@@ -209,7 +204,13 @@ class ArchiveHook(Hook):
 def download(warc_urls):
     hook = ArchiveHook()
     for url in warc_urls:
-        block_name = "-".join(url.split('/')[-1].split('.')[0].split('-')[2:4])
+        block_name_list = "-".join(url.split('/')[-1].split('.')[0].split('-')[2:5])
+        if 'ip' in block_name_list:
+            block_name_list.remove('ip')
+        else:
+            block_name_list.pop(0)
+        block_name = '-'.join(block_name_list)
+
         for cc_tuple in get_cc_text(url, html_to_text):
             if cc_tuple is None: continue
             text, meta = cc_tuple
@@ -217,11 +218,28 @@ def download(warc_urls):
         
         hook.commit_block(block_name)
 
+def continue_check(warc_urls, outdir):
+    warc_urls_to_skip = set()
+    for url in warc_urls:
+        block_name_list: list = url.split('/')[-1].split('.')[0].split('-')[2:5]
+        if 'ip' in block_name_list:
+            block_name_list.remove('ip')
+        else:
+            block_name_list.pop(0)
+        block_name = '-'.join(block_name_list)
+        print(block_name)
+        files = filter(lambda x: x.endswith('.jsonl.zst'), os.listdir(outdir))
+        for file in files:
+            if block_name in file:
+                print(f'{block_name} already exists, skipping')
+                warc_urls_to_skip.add(url)
+    return list(filter(lambda x: x not in warc_urls_to_skip, warc_urls)), len(warc_urls_to_skip)
 
 if __name__ == '__main__':
     with open('warc_urls.txt', 'r') as fh:
         warc_urls = fh.readlines()
+    warc_urls, downloaded_url_cnt = continue_check(warc_urls, 'output/en/')
     warc_urls_split = [warc_urls[i:i+len(warc_urls) // num_threads] for i in range(0, len(warc_urls), len(warc_urls) // num_threads)]
     hooks = [ArchiveHook() for _ in range(num_threads)]
     with mp.Pool(num_threads) as p:
-        list(tqdm(p.imap(download, warc_urls_split), total=len(warc_urls) // num_threads))
+        list(tqdm(p.imap(download, warc_urls_split), initial=downloaded_url_cnt // num_threads, total=len(warc_urls) // num_threads))
